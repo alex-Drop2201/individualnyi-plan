@@ -1,0 +1,23 @@
+{
+  "name": "individualnyi-plan",
+  "version": "1.0.0",
+  "scripts": {
+    "dev": "vite",
+    "build": "tsc -p . && vite build",
+    "typecheck": "tsc -p .",
+    "preview": "vite preview",
+    "deploy": "node scripts/deploy.mjs"
+  },
+  "dependencies": {
+    "html2canvas": "^1.4.1",
+    "idb-keyval": "^6.3.0",
+    "jspdf": "^4.2.1",
+    "jszip": "^3.10.2"
+  },
+  "devDependencies": {
+    "typescript": "^7.0.2",
+    "vite": "^8.3.5"
+  },
+  "private": true,
+  "type": "module"
+}
