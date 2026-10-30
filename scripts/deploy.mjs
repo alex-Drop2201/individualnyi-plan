@@ -20,8 +20,15 @@ sh("npm run build");
 
 const work = fs.mkdtempSync(path.join(os.tmpdir(), "ip-deploy-"));
 try {
-  sh("git fetch origin main");
-  sh(`git worktree add --detach "${work}" origin/main`);
+  const hasMain = out("git ls-remote --heads origin main") !== "";
+  if (hasMain) {
+    sh("git fetch origin main");
+    sh(`git worktree add --detach "${work}" origin/main`);
+  } else {
+    // First deploy: start `main` with no history of its own.
+    sh(`git worktree add --detach "${work}"`);
+    sh("git checkout -q --orphan deploy-main", { cwd: work });
+  }
   for (const f of fs.readdirSync(work)) if (f !== ".git") fs.rmSync(path.join(work, f), { recursive: true, force: true });
   fs.cpSync(path.join(root, "dist"), work, { recursive: true });
   // Notes for anyone (or any Claude session) that opens the `main` branch.
@@ -40,4 +47,5 @@ try {
   }
 } finally {
   sh(`git worktree remove --force "${work}"`);
+  if (out("git branch --list deploy-main") !== "") sh("git branch -q -D deploy-main");
 }
