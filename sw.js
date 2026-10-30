@@ -2,8 +2,8 @@
 // file list into this worker, so every deploy changes sw.js: the browser installs the new
 // worker, which caches the new files and drops the old cache.
 const PREFIX = "ip-";
-const VERSION = "1793355779401";
-const FILES = ["assets/index-CB7E-dhz.js","assets/index-WDLX9cCv.css","assets/index.es-NRfmZuRb.js","assets/purify.es-Dqk5qvad.js"];
+const VERSION = "1793355959231";
+const FILES = ["assets/index-DjqXwBtQ.js","assets/index-WDLX9cCv.css","assets/index.es-Bv4t90Fc.js","assets/purify.es-Dqk5qvad.js"];
 const at = (p) => new URL(p, self.location.href).href;
 const EXTRA = ["./", "index.html", "manifest.webmanifest", "icons/icon.svg", "icons/apple-touch-icon.png", "icons/icon-192.png", "icons/icon-512.png"];
 
