@@ -302,9 +302,19 @@ async function showEditor(id: string) {
 
   let zi = 0;
   try { zi = Math.min(Math.max(0, +(localStorage.getItem("ip.zoom") ?? 0) || 0), ZOOMS.length - 1); } catch { /* private mode */ }
-  const fit = () => (scroller.clientWidth - 16) / (width * (4 / 3));
+  // The page is laid out at full size and scaled as a whole. (CSS zoom made Safari enlarge small
+  // text to its minimum font size and drop thin table borders.)
+  const fit = () => (scroller.clientWidth - 16) / page.offsetWidth;
+  let scale = 1;
+  const sizeBox = () => {
+    zoomBox.style.width = `${page.offsetWidth * scale}px`;
+    zoomBox.style.height = `${page.offsetHeight * scale}px`;
+  };
+  new ResizeObserver(sizeBox).observe(page);
   const applyZoom = () => {
-    zoomBox.style.zoom = String(fit() * ZOOMS[zi]);
+    scale = fit() * ZOOMS[zi];
+    page.style.transform = `scale(${scale})`;
+    sizeBox();
     minus.disabled = zi === 0;
     plus.disabled = zi === ZOOMS.length - 1;
     try { localStorage.setItem("ip.zoom", String(zi)); } catch { /* private mode */ }

@@ -93,7 +93,8 @@ button { font: inherit; color: inherit; }
   background: var(--surface); border-bottom: 1px solid var(--line); color: var(--muted);
 }
 .scroller { flex: 1; overflow: auto; padding: 8px; -webkit-overflow-scrolling: touch; }
-.zoom { width: max-content; margin: 0 auto; }
+.zoom { margin: 0 auto; overflow: hidden; }
+.zoom > .page { transform-origin: 0 0; }
 .page.editing { box-shadow: 0 1px 4px rgba(0, 0, 0, 0.18); }
 .page.editing .p:focus { background: var(--focus); }
 .page.editing [data-break="before"] { border-top: 1px dashed #a0a4ad !important; }
