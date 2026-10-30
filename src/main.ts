@@ -3,7 +3,8 @@ import { DOC_CSS } from "./docx/css";
 import { DOCX_TYPE, WordDoc } from "./docx/document";
 import { canShareFiles, shareFile } from "./files";
 import { makePdf } from "./pdf";
-import { deleteDoc, getDoc, listDocs, newId, putDoc, type DocRecord } from "./store";
+import { changeDoc, deleteDoc, getDoc, listDocs, newId, putDoc, type DocRecord } from "./store";
+import { checkConfig, DEFAULT_REPO, forget, getConfig, onNotice, onSync, setConfig, syncNow, syncSoon, syncState, type SyncState } from "./sync";
 
 const app = document.getElementById("app")!;
 document.head.append(Object.assign(document.createElement("style"), { textContent: DOC_CSS }));
@@ -19,6 +20,10 @@ function h<K extends keyof HTMLElementTagNameMap>(tag: K, props: Partial<HTMLEle
 }
 
 const dateFmt = new Intl.DateTimeFormat("ru", { day: "numeric", month: "long", hour: "2-digit", minute: "2-digit" });
+const timeFmt = new Intl.DateTimeFormat("ru", { hour: "2-digit", minute: "2-digit" });
+
+/** What is on screen: the list, or the editor of one document with a check for unsaved typing. */
+let view: { id?: string; pending?: () => boolean } = {};
 
 // ---------- sheets and messages ----------
 
@@ -43,6 +48,12 @@ function busy(text: string) {
   const el = h("div", { class: "overlay" }, h("div", { class: "busy" }, h("div", { class: "spinner" }), text));
   document.body.append(el);
   return () => el.remove();
+}
+
+function toast(text: string) {
+  const el = h("div", { class: "toast", onclick: () => el.remove() }, text);
+  document.body.append(el);
+  setTimeout(() => el.remove(), 6000);
 }
 
 async function withBusy<T>(text: string, job: () => Promise<T>) {
@@ -107,6 +118,7 @@ async function importFile(f: File) {
     const now = Date.now();
     const rec: DocRecord = { id: newId(), name: f.name.replace(/\.docx$/i, ""), file, created: now, updated: now };
     await putDoc(rec);
+    syncSoon(500);
     return rec;
   });
   if (rec) location.hash = `doc=${rec.id}`;
@@ -116,7 +128,8 @@ async function rename(rec: DocRecord) {
   const name = prompt("Название документа", rec.name)?.trim();
   if (!name || name === rec.name) return false;
   rec.name = name;
-  await putDoc(rec);
+  await changeDoc(rec.id, { name });
+  syncSoon(500);
   return true;
 }
 
@@ -142,6 +155,7 @@ async function showList() {
       h("h1", {}, "Документы"),
       h("button", { class: "btn primary", onclick: () => picker.click() }, "Открыть файл"),
     ),
+    syncLine,
     h(
       "main",
       { class: "list" },
@@ -152,6 +166,7 @@ async function showList() {
             { class: "empty" },
             h("p", {}, "Здесь пока нет документов."),
             h("p", {}, "Нажмите «Открыть файл» и выберите документ Word (.docx). Он сохранится на этом телефоне, и его можно будет править и сохранять в Word или PDF."),
+            !getConfig() && h("p", {}, "Чтобы документы появлялись здесь сами, включите синхронизацию: строка «Синхронизация» вверху."),
           ),
     ),
   );
@@ -164,17 +179,100 @@ function docActions(d: DocRecord) {
     ["Сохранить как PDF", () => void exportPdf(d)],
     ["Сделать копию", async () => {
       const now = Date.now();
-      await putDoc({ ...d, id: newId(), name: `${d.name} (копия)`, created: now, updated: now });
+      await putDoc({ ...d, id: newId(), name: `${d.name} (копия)`, created: now, updated: now, rev: 1, syncedRev: 0, remoteSha: undefined, metaSha: undefined });
+      syncSoon(500);
       void showList();
     }],
     ["Переименовать", async () => { if (await rename(d)) void showList(); }],
     ["Удалить", async () => {
       if (!confirm(`Удалить «${d.name}»? Это нельзя отменить.`)) return;
+      forget(d);
       await deleteDoc(d.id);
       void showList();
     }, "danger"],
   ]);
 }
+
+// ---------- sync ----------
+
+function syncText(s: SyncState) {
+  if (s.status === "off") return "Синхронизация выключена";
+  if (s.status === "syncing") return "Синхронизирую…";
+  const at = s.last ? `в ${timeFmt.format(s.last)}` : "";
+  if (s.status === "error") return `Не удалось синхронизировать${s.error ? ` (${s.error})` : ""}`;
+  return at ? `Синхронизировано ${at}` : "Синхронизация включена";
+}
+
+const syncLine = h("button", { class: "sync-line", onclick: () => syncSheet() });
+const paintSync = (s: SyncState) => {
+  syncLine.textContent = syncText(s);
+  syncLine.dataset.status = s.status;
+};
+paintSync(syncState());
+
+function syncSheet() {
+  const c = getConfig();
+  if (c) {
+    const close = sheet(
+      "Синхронизация",
+      h("div", { class: "sheet-note" }, `Хранилище: ${c.repo}`),
+      h("div", { class: "sheet-note" }, syncText(syncState())),
+      h("button", { class: "btn wide primary", onclick: () => { close(); void syncNow(); } }, "Синхронизировать сейчас"),
+      h("button", {
+        class: "btn wide danger",
+        onclick: () => {
+          if (!confirm("Отключить синхронизацию на этом телефоне? Документы останутся на телефоне.")) return;
+          close();
+          setConfig(null);
+        },
+      }, "Отключить"),
+    );
+    return;
+  }
+  const repo = h("input", { class: "field", value: DEFAULT_REPO, autocapitalize: "off", spellcheck: false, ariaLabel: "Хранилище" });
+  const token = h("input", { class: "field", type: "password", placeholder: "Ключ доступа (github_pat_…)", autocomplete: "off", ariaLabel: "Ключ доступа" });
+  const message = h("div", { class: "sheet-note" });
+  const connect = h("button", {
+    class: "btn wide primary",
+    onclick: async () => {
+      const cfg = { repo: repo.value.trim().replace(/^https:\/\/github\.com\//, "").replace(/\/$/, ""), token: token.value.trim() };
+      if (!cfg.token) {
+        message.textContent = "Вставьте ключ доступа.";
+        return;
+      }
+      connect.disabled = true;
+      message.textContent = "Проверяю…";
+      const problem = await checkConfig(cfg);
+      connect.disabled = false;
+      if (problem) {
+        message.textContent = problem;
+        return;
+      }
+      close();
+      setConfig(cfg);
+      toast("Синхронизация включена.");
+    },
+  }, "Подключить");
+  const close = sheet(
+    "Синхронизация",
+    h("div", { class: "sheet-note" }, "Документы будут сами появляться и обновляться на этом телефоне, а правки сохраняться в приватное хранилище на GitHub."),
+    repo,
+    token,
+    message,
+    connect,
+  );
+}
+
+onNotice(toast);
+onSync((s, changed) => {
+  paintSync(s);
+  if (!changed.size) return;
+  if (!view.id) void showList();
+  else if (changed.has(view.id) && !view.pending?.()) {
+    void route();
+    toast("Документ обновлён из хранилища.");
+  }
+});
 
 // ---------- editor ----------
 
@@ -224,9 +322,9 @@ async function showEditor(id: string) {
     clearTimeout(timer);
     timer = 0;
     rec.xml = doc.serialize();
-    rec.updated = Date.now();
-    await putDoc(rec);
+    await changeDoc(rec.id, { xml: rec.xml });
     status.textContent = "Сохранено";
+    syncSoon();
   };
   saveNow = () => (timer ? save() : Promise.resolve());
   const changed = () => {
@@ -297,6 +395,7 @@ async function showEditor(id: string) {
   );
   applyZoom();
   window.onresize = applyZoom;
+  view = { id, pending: () => timer !== 0 || !!paraOf(document.activeElement) };
 }
 
 // ---------- start ----------
@@ -304,6 +403,7 @@ async function showEditor(id: string) {
 async function route() {
   await saveNow?.();
   saveNow = null;
+  view = {};
   window.onresize = null;
   const id = /doc=([\w-]+)/.exec(location.hash)?.[1];
   if (id) await showEditor(id);
@@ -312,9 +412,28 @@ async function route() {
 window.addEventListener("hashchange", () => void route());
 document.addEventListener("visibilitychange", () => {
   if (document.visibilityState === "hidden") void saveNow?.();
+  else {
+    void syncNow();
+    void navigator.serviceWorker?.getRegistration().then((r) => r?.update());
+  }
 });
+setInterval(() => document.visibilityState === "visible" && void syncNow(), 60_000);
+void syncNow();
 window.addEventListener("pagehide", () => void saveNow?.());
 void navigator.storage?.persist?.();
 void route();
 
-if ("serviceWorker" in navigator && import.meta.env.PROD) void navigator.serviceWorker.register("./sw.js");
+if ("serviceWorker" in navigator && import.meta.env.PROD) {
+  void navigator.serviceWorker.register("./sw.js");
+  // A new version of the app took over: reload into it, once nothing is being typed.
+  const hadWorker = !!navigator.serviceWorker.controller;
+  navigator.serviceWorker.addEventListener("controllerchange", () => {
+    if (!hadWorker) return;
+    const reload = async () => {
+      if (view.pending?.()) return void setTimeout(reload, 5000);
+      await saveNow?.();
+      location.reload();
+    };
+    void reload();
+  });
+}
