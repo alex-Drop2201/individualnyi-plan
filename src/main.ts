@@ -4,7 +4,7 @@ import { DOCX_TYPE, WordDoc } from "./docx/document";
 import { canShareFiles, shareFile } from "./files";
 import { makePdf } from "./pdf";
 import { changeDoc, deleteDoc, getDoc, listDocs, newId, putDoc, type DocRecord } from "./store";
-import { checkConfig, DEFAULT_REPO, forget, getConfig, onNotice, onSync, setConfig, syncNow, syncSoon, syncState, type SyncState } from "./sync";
+import { checkConfig, DEFAULT_CONFIG, forget, getConfig, onNotice, onSync, setConfig, syncNow, syncSoon, syncState, type SyncState } from "./sync";
 
 const app = document.getElementById("app")!;
 document.head.append(Object.assign(document.createElement("style"), { textContent: DOC_CSS }));
@@ -166,7 +166,7 @@ async function showList() {
             { class: "empty" },
             h("p", {}, "Здесь пока нет документов."),
             h("p", {}, "Нажмите «Открыть файл» и выберите документ Word (.docx). Он сохранится на этом телефоне, и его можно будет править и сохранять в Word или PDF."),
-            !getConfig() && h("p", {}, "Чтобы документы появлялись здесь сами, включите синхронизацию: строка «Синхронизация» вверху."),
+            h("p", {}, "Документы, которые добавляются в хранилище на GitHub, появятся здесь сами."),
           ),
     ),
   );
@@ -212,30 +212,12 @@ paintSync(syncState());
 
 function syncSheet() {
   const c = getConfig();
-  if (c) {
-    const close = sheet(
-      "Синхронизация",
-      h("div", { class: "sheet-note" }, `Хранилище: ${c.repo}`),
-      h("div", { class: "sheet-note" }, syncText(syncState())),
-      h("button", { class: "btn wide primary", onclick: () => { close(); void syncNow(); } }, "Синхронизировать сейчас"),
-      h("button", {
-        class: "btn wide danger",
-        onclick: () => {
-          if (!confirm("Отключить синхронизацию на этом телефоне? Документы останутся на телефоне.")) return;
-          close();
-          setConfig(null);
-        },
-      }, "Отключить"),
-    );
-    return;
-  }
-  const repo = h("input", { class: "field", value: DEFAULT_REPO, autocapitalize: "off", spellcheck: false, ariaLabel: "Хранилище" });
   const token = h("input", { class: "field", type: "password", placeholder: "Ключ доступа (github_pat_…)", autocomplete: "off", ariaLabel: "Ключ доступа" });
   const message = h("div", { class: "sheet-note" });
   const connect = h("button", {
-    class: "btn wide primary",
+    class: "btn wide",
     onclick: async () => {
-      const cfg = { repo: repo.value.trim().replace(/^https:\/\/github\.com\//, "").replace(/\/$/, ""), token: token.value.trim() };
+      const cfg = { ...c, token: token.value.trim() };
       if (!cfg.token) {
         message.textContent = "Вставьте ключ доступа.";
         return;
@@ -250,16 +232,30 @@ function syncSheet() {
       }
       close();
       setConfig(cfg);
-      toast("Синхронизация включена.");
+      toast("Ключ добавлен: правки с телефона тоже будут сохраняться в хранилище.");
     },
-  }, "Подключить");
+  }, "Добавить ключ");
   const close = sheet(
     "Синхронизация",
-    h("div", { class: "sheet-note" }, "Документы будут сами появляться и обновляться на этом телефоне, а правки сохраняться в приватное хранилище на GitHub."),
-    repo,
-    token,
-    message,
-    connect,
+    h("div", { class: "sheet-note" }, syncText(syncState())),
+    h(
+      "div",
+      { class: "sheet-note" },
+      c.token
+        ? "Новые документы появляются здесь сами, правки с телефона сохраняются в хранилище на GitHub."
+        : "Новые и обновлённые документы появляются здесь сами. Правки с телефона остаются на телефоне; чтобы они тоже уходили в хранилище, добавьте ключ доступа.",
+    ),
+    h("button", { class: "btn wide primary", onclick: () => { close(); void syncNow(); } }, "Синхронизировать сейчас"),
+    ...(c.token
+      ? [h("button", {
+          class: "btn wide",
+          onclick: () => {
+            if (!confirm("Убрать ключ? Документы продолжат приходить, но правки с телефона перестанут уходить в хранилище.")) return;
+            close();
+            setConfig({ ...DEFAULT_CONFIG, ...c, token: undefined });
+          },
+        }, "Убрать ключ")]
+      : [token, message, connect]),
   );
 }
 

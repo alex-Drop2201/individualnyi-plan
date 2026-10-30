@@ -1,8 +1,10 @@
-// Two-way sync with a private GitHub repository through the GitHub API.
-// Layout of the repository: docs/<id>.docx (the document as it is now) and docs/<id>.json
-// ({ name, created, updated }). The phone keeps the key (a fine-grained token with
-// Contents read/write on that one repository) in localStorage; nothing goes to this app's
-// public repository.
+// Sync with a GitHub repository branch through the GitHub API (by default the `data` branch
+// of this app's own public repository). Layout: docs/<id>.docx (the document as it is now)
+// and docs/<id>.json ({ name, created, updated }).
+//
+// Without a key the app only downloads: new and changed documents appear by themselves, and
+// edits made on the phone stay on the phone. With a key (a fine-grained token with Contents
+// read/write, kept in localStorage) edits and deletions are uploaded too.
 //
 // One run: delete what was deleted here, download what changed there, upload what changed here.
 // If a document changed in both places, the repository's version wins and the phone's
@@ -12,7 +14,8 @@ import { isDirty, listDocs, newId, putDoc, updateDoc, type DocRecord } from "./s
 
 export interface SyncConfig {
   repo: string;
-  token: string;
+  branch?: string;
+  token?: string;
 }
 export type SyncState = { status: "off" | "syncing" | "ok" | "error"; last?: number; error?: string };
 
@@ -20,7 +23,7 @@ const CONFIG_KEY = "ip.sync";
 const DELETED_KEY = "ip.sync.deleted";
 const API = "https://api.github.com";
 
-export const DEFAULT_REPO = "alex-Drop2201/individualnyi-plan-data";
+export const DEFAULT_CONFIG: SyncConfig = { repo: "alex-Drop2201/individualnyi-plan", branch: "data" };
 
 function readJson<T>(key: string, fallback: T): T {
   try {
@@ -38,9 +41,10 @@ function writeJson(key: string, value: unknown) {
   }
 }
 
-export const getConfig = () => readJson<SyncConfig | null>(CONFIG_KEY, null);
+/** The saved setup, or the default one (download only) when nothing was saved. */
+export const getConfig = (): SyncConfig => readJson<SyncConfig | null>(CONFIG_KEY, null) ?? DEFAULT_CONFIG;
 
-let state: SyncState = { status: getConfig() ? "ok" : "off" };
+let state: SyncState = { status: "ok" };
 const listeners = new Set<(s: SyncState, changed: Set<string>) => void>();
 /** Called after each run with the state and the ids of documents that changed here from the repository. */
 export function onSync(fn: (s: SyncState, changed: Set<string>) => void) {
@@ -67,16 +71,19 @@ class HttpError extends Error {
 }
 
 async function api(c: SyncConfig, path: string, init: RequestInit & { accept?: string } = {}) {
-  const res = await fetch(`${API}/repos/${c.repo}/${path}`, {
+  const ref = path.startsWith("contents") && !init.method && c.branch ? `?ref=${encodeURIComponent(c.branch)}` : "";
+  const res = await fetch(`${API}/repos/${c.repo}/${path}${ref}`, {
     ...init,
-    cache: "no-store",
+    // Revalidate instead of refetching: an unchanged answer (304) does not count against GitHub's limit.
+    cache: "no-cache",
     headers: {
-      Authorization: `Bearer ${c.token}`,
+      ...(c.token ? { Authorization: `Bearer ${c.token}` } : {}),
       Accept: init.accept ?? "application/vnd.github+json",
       "X-GitHub-Api-Version": "2022-11-28",
       ...(init.body ? { "Content-Type": "application/json" } : {}),
     },
   });
+  if (res.status === 403 || res.status === 429) throw new HttpError(res.status, "GitHub временно ограничил запросы, повторю позже");
   if (!res.ok) throw new HttpError(res.status, `GitHub ответил ${res.status}`);
   return res;
 }
@@ -90,13 +97,13 @@ function toBase64(bytes: Uint8Array) {
 }
 
 async function putFile(c: SyncConfig, path: string, bytes: Uint8Array, sha: string | undefined, message: string) {
-  const res = await api(c, `contents/${path}`, { method: "PUT", body: JSON.stringify({ message, content: toBase64(bytes), ...(sha ? { sha } : {}) }) });
+  const res = await api(c, `contents/${path}`, { method: "PUT", body: JSON.stringify({ message, branch: c.branch, content: toBase64(bytes), ...(sha ? { sha } : {}) }) });
   return ((await res.json()) as { content: { sha: string } }).content.sha;
 }
 
 async function deleteFile(c: SyncConfig, path: string, sha: string, message: string) {
   try {
-    await api(c, `contents/${path}`, { method: "DELETE", body: JSON.stringify({ message, sha }) });
+    await api(c, `contents/${path}`, { method: "DELETE", body: JSON.stringify({ message, branch: c.branch, sha }) });
   } catch (e) {
     if (!(e instanceof HttpError && e.status === 404)) throw e;
   }
@@ -106,8 +113,7 @@ async function deleteFile(c: SyncConfig, path: string, sha: string, message: str
 export async function checkConfig(c: SyncConfig): Promise<string | null> {
   try {
     const res = await api(c, "");
-    const repo = (await res.json()) as { private: boolean; permissions?: { push?: boolean } };
-    if (!repo.private) return "Это хранилище публичное. Для документов нужно приватное (Private).";
+    const repo = (await res.json()) as { permissions?: { push?: boolean } };
     if (repo.permissions && !repo.permissions.push) return "Ключ даёт только чтение. Нужно право Contents: Read and write.";
     return null;
   } catch (e) {
@@ -119,8 +125,8 @@ export async function checkConfig(c: SyncConfig): Promise<string | null> {
 
 export function setConfig(c: SyncConfig | null) {
   writeJson(CONFIG_KEY, c);
-  emit({ status: c ? "ok" : "off" });
-  if (c) void syncNow();
+  emit({ status: "ok" });
+  void syncNow();
 }
 
 // ---------- local deletions ----------
@@ -129,7 +135,7 @@ interface Tombstone { id: string; doc?: string; meta?: string }
 
 /** Remembers a deleted document so the next run deletes it in the repository too. */
 export function forget(d: DocRecord) {
-  if (!getConfig() || !d.remoteSha) return;
+  if (!getConfig().token || !d.remoteSha) return;
   writeJson(DELETED_KEY, [...readJson<Tombstone[]>(DELETED_KEY, []), { id: d.id, doc: d.remoteSha, meta: d.metaSha }]);
   syncSoon();
 }
@@ -142,14 +148,13 @@ let timer = 0;
 
 /** Syncs a little later, so a burst of edits makes one upload. */
 export function syncSoon(delay = 3000) {
-  if (!getConfig()) return;
+  if (!getConfig().token) return; // nothing to upload without a key
   clearTimeout(timer);
   timer = window.setTimeout(() => void syncNow(), delay);
 }
 
 export function syncNow(): Promise<void> {
   const c = getConfig();
-  if (!c) return Promise.resolve();
   if (running) {
     again = true;
     return running;
@@ -192,7 +197,7 @@ async function run(c: SyncConfig): Promise<Set<string>> {
   }
 
   // 1. Deletions made on the phone
-  for (const t of readJson<Tombstone[]>(DELETED_KEY, [])) {
+  for (const t of c.token ? readJson<Tombstone[]>(DELETED_KEY, []) : []) {
     const r = remote.get(t.id);
     if (r?.doc) await deleteFile(c, `docs/${t.id}.docx`, r.doc, "Удалён на телефоне");
     if (r?.meta) await deleteFile(c, `docs/${t.id}.json`, r.meta, "Удалён на телефоне");
@@ -247,7 +252,7 @@ async function run(c: SyncConfig): Promise<Set<string>> {
       await updateDoc(d.id, (cur) => ({ ...cur, remoteSha: undefined, metaSha: undefined, syncedRev: 0 }));
 
   // 3. Changes made on the phone
-  for (const d of await listDocs()) {
+  for (const d of c.token ? await listDocs() : []) {
     if (!isDirty(d)) continue;
     const rev = d.rev ?? 1;
     const bytes = new Uint8Array(d.xml ? await (await (await WordDoc.open(d.file, d.xml)).toDocx()).arrayBuffer() : d.file);
