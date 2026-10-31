@@ -2,8 +2,8 @@
 // file list into this worker, so every deploy changes sw.js: the browser installs the new
 // worker, which caches the new files and drops the old cache.
 const PREFIX = "ip-";
-const VERSION = "1793400319880";
-const FILES = ["assets/index-BL9Mi4yl.js","assets/index-DKqTQYXJ.css","assets/index.es-DHkNlpwb.js","assets/purify.es-Dqk5qvad.js"];
+const VERSION = "1793484006776";
+const FILES = ["assets/index-CAD87Nhf.js","assets/index-_x_RHFqY.css","assets/index.es-DTD3OvKY.js","assets/purify.es-Dqk5qvad.js"];
 const at = (p) => new URL(p, self.location.href).href;
 const EXTRA = ["./", "index.html", "manifest.webmanifest", "icons/icon.svg", "icons/apple-touch-icon.png", "icons/icon-192.png", "icons/icon-512.png"];
 
@@ -32,7 +32,10 @@ self.addEventListener("fetch", (event) => {
   if (req.method !== "GET" || new URL(req.url).origin !== self.location.origin) return;
   if (req.mode === "navigate") {
     // Network first for the page, so a new version shows up when online.
-    event.respondWith(fetch(req).catch(() => caches.match(at("index.html"), { ignoreVary: true, ignoreSearch: true })));
+    // "no-cache": ask the server every time, so a new version is not hidden by the HTTP cache.
+    event.respondWith(
+      fetch(req.url, { cache: "no-cache", credentials: "same-origin" }).catch(() => caches.match(at("index.html"), { ignoreVary: true, ignoreSearch: true })),
+    );
     return;
   }
   event.respondWith(caches.match(req, { ignoreVary: true }).then((hit) => hit || fetch(req)));
