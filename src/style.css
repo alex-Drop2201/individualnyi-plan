@@ -26,6 +26,7 @@
 
 * { -webkit-tap-highlight-color: transparent; }
 html, body { margin: 0; height: 100%; }
+html { -webkit-text-size-adjust: 100%; text-size-adjust: 100%; }
 body {
   background: var(--bg);
   color: var(--text);
@@ -106,6 +107,12 @@ button { font: inherit; color: inherit; }
   background: var(--surface); border-top: 1px solid var(--line);
 }
 .spacer { flex: 1; }
+.tools { gap: 4px; padding-left: 8px; padding-right: 8px; }
+.tools .icon-btn { min-width: 40px; }
+.tools .btn { padding: 0 12px; }
+.page.editing .flash { background: rgba(90, 160, 255, 0.25); transition: background 0.6s; }
+.version { margin-top: 32px; font-size: 13px; color: var(--muted); }
+.link { border: 0; background: none; padding: 8px 0; color: var(--accent); font-size: 13px; cursor: pointer; }
 
 .overlay {
   position: fixed; inset: 0; z-index: 10; background: rgba(0, 0, 0, 0.4);

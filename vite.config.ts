@@ -23,5 +23,6 @@ function serviceWorker(): Plugin {
 export default defineConfig({
   base: "./",
   plugins: [serviceWorker()],
+  define: { __BUILD__: JSON.stringify(Date.now()) },
   build: { chunkSizeWarningLimit: 1500 },
 });

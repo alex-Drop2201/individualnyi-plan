@@ -32,7 +32,10 @@ self.addEventListener("fetch", (event) => {
   if (req.method !== "GET" || new URL(req.url).origin !== self.location.origin) return;
   if (req.mode === "navigate") {
     // Network first for the page, so a new version shows up when online.
-    event.respondWith(fetch(req).catch(() => caches.match(at("index.html"), { ignoreVary: true, ignoreSearch: true })));
+    // "no-cache": ask the server every time, so a new version is not hidden by the HTTP cache.
+    event.respondWith(
+      fetch(req.url, { cache: "no-cache", credentials: "same-origin" }).catch(() => caches.match(at("index.html"), { ignoreVary: true, ignoreSearch: true })),
+    );
     return;
   }
   event.respondWith(caches.match(req, { ignoreVary: true }).then((hit) => hit || fetch(req)));

@@ -8,5 +8,6 @@ export const DOC_CSS = `
 .tbl td{box-sizing:border-box;overflow-wrap:anywhere;padding:0}
 .tbl td.gap{border:none}
 .cell{display:flex;flex-direction:column}
+.p [data-blank]{word-break:break-all}
 .page img{display:inline-block;vertical-align:bottom}
 `;

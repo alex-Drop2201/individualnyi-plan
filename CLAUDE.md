@@ -18,6 +18,10 @@ PWA for editing the text of .docx documents on iPhone; the owner builds it for t
 - Runs holding anything other than text are locked (`data-l`) and must survive edits untouched.
 - Stored data: IndexedDB `individualnyi-plan`/`docs`, `DocRecord` in `src/store.ts`. Documents already on the phone must keep opening: only add optional fields.
 - `src/docx/css.ts` is shared by the editor and the PDF renderer (which draws pages outside the app stylesheet).
+- Fill-in lines (`src/fill.ts`): runs of "____" or underlined spaces are marked `data-blank`. Typing over one keeps the paragraph's shape (same lines, same end): the line gives up or gets back characters next to the caret. Text typed onto "____" goes into an underlined run (`data-like`/`data-u`, and `data-font` for the label's typeface on a bare line).
+- `toDocx()` puts zero-width spaces between the underscores of long lines (10+) so Word wraps them like the editor does; `open()` takes them out again. Keep both sides in step.
+- Undo/redo (editor buttons): per-paragraph XML snapshots (`WordDoc.snapshot` / `restore`), one step per burst of typing.
+- The editor page is laid out at full size and scaled with a transform. Do not use CSS `zoom`: on iPhone it enlarged small text and dropped thin table borders.
 
 ## Sync and the `data` branch
 

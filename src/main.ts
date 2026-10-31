@@ -2,9 +2,12 @@ import "./style.css";
 import { DOC_CSS } from "./docx/css";
 import { DOCX_TYPE, WordDoc } from "./docx/document";
 import { canShareFiles, shareFile } from "./files";
+import { hasLine, keepLineLength, shapeOf, typeOnLine, type Shape } from "./fill";
 import { makePdf } from "./pdf";
 import { changeDoc, deleteDoc, getDoc, listDocs, newId, putDoc, type DocRecord } from "./store";
 import { checkConfig, DEFAULT_CONFIG, forget, getConfig, onNotice, onSync, setConfig, syncNow, syncSoon, syncState, type SyncState } from "./sync";
+
+declare const __BUILD__: number;
 
 const app = document.getElementById("app")!;
 document.head.append(Object.assign(document.createElement("style"), { textContent: DOC_CSS }));
@@ -168,6 +171,12 @@ async function showList() {
             h("p", {}, "Нажмите «Открыть файл» и выберите документ Word (.docx). Он сохранится на этом телефоне, и его можно будет править и сохранять в Word или PDF."),
             h("p", {}, "Документы, которые добавляются в хранилище на GitHub, появятся здесь сами."),
           ),
+      h(
+        "p",
+        { class: "version" },
+        `Версия приложения от ${dateFmt.format(__BUILD__)}. `,
+        h("button", { class: "link", onclick: () => location.reload() }, "Обновить"),
+      ),
     ),
   );
 }
@@ -340,34 +349,126 @@ async function showEditor(id: string) {
   };
 
   const paraOf = (t: EventTarget | null) => (t instanceof Element ? (t.closest(".p") as HTMLElement | null) : null);
+
+  // Undo and redo: each step is one paragraph before and after a burst of typing.
+  interface Step { pid: string; before: string; after: string; at: number }
+  const undos: Step[] = [];
+  const redos: Step[] = [];
+  const known = new Map<string, string>(); // paragraph XML as last recorded
+  const remember = (div: HTMLElement) => {
+    const pid = div.dataset.p!;
+    if (!known.has(pid)) known.set(pid, doc.snapshot(pid) ?? "");
+  };
+  const record = (div: HTMLElement) => {
+    const pid = div.dataset.p!;
+    const after = doc.snapshot(pid) ?? "";
+    const before = known.get(pid) ?? after;
+    known.set(pid, after);
+    if (before === after) return;
+    const top = undos[undos.length - 1];
+    if (top && top.pid === pid && Date.now() - top.at < 2000) Object.assign(top, { after, at: Date.now() });
+    else undos.push({ pid, before, after, at: Date.now() });
+    if (undos.length > 300) undos.shift();
+    redos.length = 0;
+    paintUndo();
+  };
+  const step = (from: Step[], to: Step[], key: "before" | "after") => {
+    (document.activeElement as HTMLElement | null)?.blur?.(); // records the paragraph being typed in first
+    const s = from.pop();
+    if (!s) return;
+    const div = body.querySelector<HTMLElement>(`[data-p="${s.pid}"]`);
+    if (div) {
+      const fresh = doc.restore(div, s[key]);
+      known.set(s.pid, s[key]);
+      fresh.classList.add("flash");
+      setTimeout(() => fresh.classList.remove("flash"), 1200);
+      const r = fresh.getBoundingClientRect();
+      const box = scroller.getBoundingClientRect();
+      if (r.bottom < box.top || r.top > box.bottom) fresh.scrollIntoView({ block: "center" });
+      changed();
+    }
+    to.push(s);
+    paintUndo();
+  };
+  const undo = () => step(undos, redos, "before");
+  const redo = () => step(redos, undos, "after");
+  const undoBtn = h("button", { class: "icon-btn", ariaLabel: "Отменить", textContent: "↶", onclick: undo });
+  const redoBtn = h("button", { class: "icon-btn", ariaLabel: "Вернуть", textContent: "↷", onclick: redo });
+  const paintUndo = () => {
+    undoBtn.disabled = !undos.length;
+    redoBtn.disabled = !redos.length;
+  };
+  paintUndo();
+
+  // Width of the paragraph before an edit, when it has a fill-in line to keep at its length.
+  let widthBefore: { div: HTMLElement; shape: Shape } | null = null;
+  const afterEdit = (div: HTMLElement) => {
+    if (widthBefore?.div === div) keepLineLength(div, widthBefore.shape);
+    widthBefore = null;
+    if (doc.sync(div)) {
+      changed();
+      record(div);
+    }
+  };
+  body.addEventListener("focusin", (e) => {
+    const div = paraOf(e.target);
+    if (div) remember(div);
+  });
   body.addEventListener("beforeinput", (e) => {
-    if (e.inputType.startsWith("format")) e.preventDefault();
-    else if (e.inputType === "insertParagraph") {
+    const div = paraOf(e.target);
+    if (div) remember(div);
+    if (e.inputType.startsWith("format")) {
+      e.preventDefault();
+      return;
+    }
+    if (e.inputType === "historyUndo" || e.inputType === "historyRedo") {
+      // The phone's own undo (shake, keyboard) would fight with ours: do ours.
+      e.preventDefault();
+      if (e.inputType === "historyUndo") undo();
+      else redo();
+      return;
+    }
+    if (e.inputType === "insertParagraph") {
       // Enter starts a new line inside the same paragraph (a line break in Word).
       e.preventDefault();
       document.execCommand("insertLineBreak");
+      return;
+    }
+    widthBefore = div && hasLine(div) ? { div, shape: shapeOf(div) } : null;
+    if (div && widthBefore && e.inputType === "insertText" && e.data && typeOnLine(e.data)) {
+      e.preventDefault();
+      afterEdit(div);
     }
   });
   body.addEventListener("paste", (e) => {
     e.preventDefault();
+    const div = paraOf(e.target);
+    if (div) remember(div);
+    widthBefore = div && hasLine(div) ? { div, shape: shapeOf(div) } : null;
     const text = e.clipboardData?.getData("text/plain") ?? "";
     document.execCommand("insertText", false, text.replace(/\r\n?/g, "\n"));
   });
   body.addEventListener("drop", (e) => e.preventDefault());
   body.addEventListener("input", (e) => {
     const div = paraOf(e.target);
-    if (div && doc.sync(div)) changed();
+    if (div) afterEdit(div);
   });
   body.addEventListener("focusout", (e) => {
     const div = paraOf(e.target);
     if (!div) return;
-    if (doc.sync(div)) changed();
+    if (doc.sync(div)) {
+      changed();
+      record(div);
+    }
     doc.refresh(div);
   });
 
   const flush = () => {
     const div = paraOf(document.activeElement);
-    if (div && doc.sync(div)) changed();
+    if (div && doc.sync(div)) {
+      changed();
+      record(div);
+    }
     return saveNow?.();
   };
   const back = async () => {
@@ -380,7 +481,7 @@ async function showEditor(id: string) {
     hint = h(
       "div",
       { class: "hint" },
-      h("span", {}, "Нажмите на любой текст, чтобы изменить его. В пустые клетки таблиц и строки «____» тоже можно писать. Всё сохраняется само."),
+      h("span", {}, "Нажмите на любой текст, чтобы изменить его. В пустые клетки таблиц и на линии «____» тоже можно писать: текст ложится на линию. ↶ и ↷ отменяют и возвращают правки. Всё сохраняется само."),
       h("button", { class: "icon-btn", ariaLabel: "Скрыть", textContent: "✕", onclick: () => { hint?.remove(); try { localStorage.setItem("ip.hint", "1"); } catch { /* */ } } }),
     );
   }
@@ -392,6 +493,8 @@ async function showEditor(id: string) {
     h(
       "footer",
       { class: "tools" },
+      undoBtn,
+      redoBtn,
       minus,
       plus,
       h("span", { class: "spacer" }),

@@ -26,6 +26,7 @@ const TEXTY = new Set(["rPr", "t", "tab", "br", "cr", "noBreakHyphen", "softHyph
 const RUN_WRAPPERS = new Set(["hyperlink", "smartTag", "ins", "customXml", "fldSimple", "moveTo", "dir", "bdo"]);
 
 const pt = (twips: number) => `${twips / 20}pt`;
+const ZWSP = "\u200b";
 const isPageBreak = (br: Element) => ["page", "column"].includes(wattr(br, "type") ?? "");
 
 export interface Section {
@@ -91,6 +92,9 @@ export class WordDoc {
     const xml = new DOMParser().parseFromString(text, "application/xml");
     if (xml.getElementsByTagName("parsererror").length || !kid(xml.documentElement, "body"))
       throw new Error("Не удалось прочитать документ.");
+    // Break points that toDocx() put into fill-in lines come out again for editing.
+    for (const t of Array.from(xml.getElementsByTagNameNS(W, "t")))
+      if (t.textContent?.includes(ZWSP)) t.textContent = t.textContent.replace(/_\u200b/g, "_").replace(/\u200b_/g, "_");
     const theme = new Theme(await read("word/theme/theme1.xml"));
     const styles = new Styles(await read("word/styles.xml"), theme);
     const numbering = new Numbering(await read("word/numbering.xml"), theme);
@@ -114,7 +118,14 @@ export class WordDoc {
   }
 
   async toDocx(): Promise<Blob> {
-    this.zip.file(DOC_PATH, this.serialize());
+    // Word keeps a run of underscores together like one long word, so a line that follows typed
+    // text would jump to the next line. Invisible break points between the underscores let
+    // it wrap where it reaches the margin, as in the editor.
+    const copy = this.xml.cloneNode(true) as XMLDocument;
+    for (const t of Array.from(copy.getElementsByTagNameNS(W, "t")))
+      if (/_{10}/.test(t.textContent ?? "")) t.textContent = t.textContent!.replace(/_{10,}/g, (m) => m.split("").join(ZWSP));
+    const s = new XMLSerializer().serializeToString(copy);
+    this.zip.file(DOC_PATH, s.startsWith("<?xml") ? s : `<?xml version="1.0" encoding="UTF-8" standalone="yes"?>\r\n${s}`);
     return this.zip.generateAsync({ type: "blob", mimeType: DOCX_TYPE, compression: "DEFLATE" });
   }
 
@@ -224,6 +235,23 @@ export class WordDoc {
   }
 
   /** Redraws one paragraph from the XML (after editing it), keeping its list label. */
+  /** A paragraph's XML, for undo. */
+  snapshot(pid: string | undefined) {
+    const p = this.node(pid);
+    return p ? new XMLSerializer().serializeToString(p) : undefined;
+  }
+
+  /** Puts a paragraph back as it was in a snapshot and redraws it. Returns the new element. */
+  restore(div: HTMLElement, xml: string) {
+    const p = this.node(div.dataset.p);
+    if (!p) return div;
+    const saved = new DOMParser().parseFromString(xml, "application/xml").documentElement;
+    p.replaceChildren(...Array.from(saved.childNodes, (c) => this.xml.importNode(c, true)));
+    const fresh = this.paragraph(p, true, false);
+    div.replaceWith(fresh);
+    return fresh;
+  }
+
   refresh(div: HTMLElement) {
     const p = this.node(div.dataset.p);
     if (p) div.replaceWith(this.paragraph(p, true, false));
@@ -290,6 +318,9 @@ export class WordDoc {
       if (this.isEditable(r, p)) {
         span.dataset.r = this.id(r);
         span.textContent = this.runText(r);
+        // A fill-in line ("____" or underlined spaces): typing over it keeps its length (see the editor).
+        if (/_{2,}/.test(span.textContent)) span.dataset.blank = "_";
+        else if (props.u && / {3,}/.test(span.textContent)) span.dataset.blank = " ";
         hasText ||= span.textContent !== "";
         div.append(span);
         continue;
@@ -485,12 +516,14 @@ export class WordDoc {
     const was = new XMLSerializer().serializeToString(p);
     const editable = this.runs(p).filter((r) => this.isEditable(r, p));
 
-    interface Seg { run?: Element; lock?: Element; text: string; from: Element; br?: boolean }
+    // `fresh`: text that gets a new run formatted like that run (plus underline when `u`).
+    interface Fresh { src: Element; u: boolean; font?: Element }
+    interface Seg { run?: Element; lock?: Element; text: string; from: Element; br?: boolean; fresh?: Fresh }
     const segs: Seg[] = [];
-    const walk = (node: Node, owner: Element | undefined) => {
+    const walk = (node: Node, owner: Element | undefined, fresh?: Fresh) => {
       for (const ch of Array.from(node.childNodes)) {
         if (ch.nodeType === Node.TEXT_NODE) {
-          if (ch.nodeValue) segs.push({ run: owner, text: ch.nodeValue, from: ch.parentElement ?? div });
+          if (ch.nodeValue) segs.push({ run: fresh ? undefined : owner, fresh, text: ch.nodeValue, from: ch.parentElement ?? div });
           continue;
         }
         if (!(ch instanceof HTMLElement)) continue;
@@ -501,13 +534,16 @@ export class WordDoc {
           continue;
         }
         if (ch.tagName === "BR") {
-          segs.push({ run: owner, text: "\n", from: node as Element, br: true });
+          segs.push({ run: fresh ? undefined : owner, fresh, text: "\n", from: node as Element, br: true });
           continue;
         }
         // Some browsers wrap a new line in its own <div>.
         if ((ch.tagName === "DIV" || ch.tagName === "P") && segs.some((s) => s.text)) segs.push({ run: owner, text: "\n", from: ch });
         const run = this.node(ch.dataset.r);
-        walk(ch, run && editable.includes(run) ? run : owner);
+        const like = this.node(ch.dataset.like);
+        if (like) walk(ch, undefined, { src: like, u: ch.dataset.u !== undefined, font: this.node(ch.dataset.font) }); // typed onto a fill-in line
+        else if (run && !editable.includes(run)) walk(ch, undefined, { src: run, u: false }); // its run was emptied earlier
+        else walk(ch, run ?? owner, fresh);
       }
     };
     walk(div, undefined);
@@ -523,45 +559,88 @@ export class WordDoc {
     let prev: Element | undefined;
     for (const s of segs) {
       if (s.lock) continue;
-      if (!s.run && s.text) s.run = this.likeliestRun(s.from, div, p, editable, inDom, prev);
+      if (!s.run && !s.fresh && s.text) s.run = this.likeliestRun(s.from, div, p, editable, inDom, prev);
       prev = s.run ?? prev;
     }
 
     const used = new Set<Element>();
     let last: Element | undefined;
     const after = (a: Element, b: Element | undefined) => !b || !!(b.compareDocumentPosition(a) & Node.DOCUMENT_POSITION_FOLLOWING);
+    /** A new run after the last written one, formatted like `rPr`. */
+    const newRun = (rPr: Element | undefined, underline = false, fontOf?: Element) => {
+      const run = this.xml.createElementNS(W, "w:r");
+      if (rPr || underline || fontOf) {
+        const copy = rPr ? (rPr.cloneNode(true) as Element) : this.xml.createElementNS(W, "w:rPr");
+        for (const c of kids(copy)) if (["ins", "del", "moveFrom", "moveTo", "rPrChange"].includes(c.localName)) c.remove();
+        if (underline) this.underline(copy);
+        if (fontOf) this.copyFont(copy, fontOf);
+        run.append(copy);
+      }
+      if (last) last.parentNode!.insertBefore(run, last.nextSibling);
+      else {
+        const first = kids(p).find((c) => c.localName !== "pPr");
+        p.insertBefore(run, first ?? null);
+      }
+      return run;
+    };
+    let freshRun: Element | undefined;
+    let freshOf: Fresh | undefined;
     for (const s of segs) {
       if (s.lock) {
         if (after(s.lock, last)) last = s.lock;
         continue;
       }
       if (!s.text) continue;
+      if (s.fresh) {
+        if (freshRun && last === freshRun && freshOf?.src === s.fresh.src && freshOf.u === s.fresh.u) {
+          this.setRunText(freshRun, this.runText(freshRun) + s.text);
+          continue;
+        }
+        freshRun = newRun(kid(s.fresh.src, "rPr"), s.fresh.u, s.fresh.font);
+        freshOf = s.fresh;
+        this.setRunText(freshRun, s.text);
+        used.add(freshRun);
+        last = freshRun;
+        continue;
+      }
       let target = s.run;
       if (target && last === target && used.has(target)) {
         this.setRunText(target, this.runText(target) + s.text);
         continue;
       }
-      if (!target || used.has(target) || !after(target, last)) {
-        const fresh = this.xml.createElementNS(W, "w:r");
-        const rPr = target ? kid(target, "rPr") : kid(kid(p, "pPr"), "rPr");
-        if (rPr) {
-          const copy = rPr.cloneNode(true) as Element;
-          for (const c of kids(copy)) if (["ins", "del", "moveFrom", "moveTo", "rPrChange"].includes(c.localName)) c.remove();
-          fresh.append(copy);
-        }
-        if (last) last.parentNode!.insertBefore(fresh, last.nextSibling);
-        else {
-          const first = kids(p).find((c) => c.localName !== "pPr");
-          p.insertBefore(fresh, first ?? null);
-        }
-        target = fresh;
-      }
+      if (!target || used.has(target) || !after(target, last)) target = newRun(target ? kid(target, "rPr") : kid(kid(p, "pPr"), "rPr"));
       this.setRunText(target, s.text);
       used.add(target);
       last = target;
     }
     for (const r of editable) if (!used.has(r)) r.remove();
     return new XMLSerializer().serializeToString(p) !== was;
+  }
+
+  /** Gives run properties the typeface that `run` shows (from its own formatting or its styles). */
+  private copyFont(rPr: Element, run: Element) {
+    let p: Node | null = run.parentNode;
+    while (p && !(p instanceof Element && p.localName === "p")) p = p.parentNode;
+    const font = p ? this.runProps(run, p as Element).font : undefined;
+    if (!font) return;
+    for (const c of kids(rPr)) if (c.localName === "rFonts") c.remove();
+    const f = this.xml.createElementNS(W, "w:rFonts");
+    for (const a of ["ascii", "hAnsi", "cs"]) f.setAttributeNS(W, `w:${a}`, font);
+    const style = kid(rPr, "rStyle");
+    rPr.insertBefore(f, style ? style.nextSibling : rPr.firstChild);
+  }
+
+  /** Adds a single underline to run properties, keeping the schema's element order. */
+  private underline(rPr: Element) {
+    const u = kid(rPr, "u");
+    if (u) {
+      if (["none", "0", "false"].includes(val(u) ?? "single")) u.setAttributeNS(W, "w:val", "single");
+      return;
+    }
+    const el = this.xml.createElementNS(W, "w:u");
+    el.setAttributeNS(W, "w:val", "single");
+    const LATER = ["effect", "bdr", "shd", "fitText", "vertAlign", "rtl", "cs", "em", "lang", "eastAsianLayout", "specVanish", "oMath"];
+    rPr.insertBefore(el, kids(rPr).find((c) => LATER.includes(c.localName)) ?? null);
   }
 
   private likeliestRun(from: Element, div: HTMLElement, p: Element, runs: Element[], inDom: Set<Element | undefined>, prev?: Element) {
