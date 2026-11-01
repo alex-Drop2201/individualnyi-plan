@@ -47,10 +47,16 @@ export function fontStack(font?: string) {
 /** Word's single line spacing is a little more than 1em and depends on the font. */
 const lineFactor = (font?: string) => (/calibri|cambria/i.test(font ?? "") ? 1.22 : 1.15);
 
+/**
+ * At least 1 CSS px (0.75pt): Safari draws collapsed table borders in whole pixels and drops
+ * thinner ones, and Word's usual thin border is ½pt (0.67px). The .docx keeps its own widths.
+ */
+const MIN_BORDER = 0.75;
+
 function cssBorder(b: Border | null | undefined) {
   if (!b) return "none";
   const style = b.style === "double" ? "double" : /dash/i.test(b.style) ? "dashed" : /dot/i.test(b.style) ? "dotted" : "solid";
-  return `${b.style === "double" ? Math.max(b.width, 2.25) : b.width}pt ${style} ${b.color}`;
+  return `${Math.max(b.width, b.style === "double" ? 2.25 : MIN_BORDER)}pt ${style} ${b.color}`;
 }
 
 export class WordDoc {
