@@ -54,6 +54,7 @@ export interface ParaProps {
   numId?: string;
   ilvl?: number;
   pageBreakBefore?: boolean;
+  keepNext?: boolean;
 }
 
 /** Later sources override earlier ones, field by field (undefined never overrides). */
@@ -146,6 +147,7 @@ export function readPPr(pPr: Element | undefined): Partial<ParaProps> | undefine
     numId: val(kid(numPr, "numId")) ?? undefined,
     ilvl: num(val(kid(numPr, "ilvl"))),
     pageBreakBefore: toggle(kid(pPr, "pageBreakBefore")),
+    keepNext: toggle(kid(pPr, "keepNext")),
   };
 }
 

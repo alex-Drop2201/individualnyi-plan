@@ -29,6 +29,15 @@ const pt = (twips: number) => `${twips / 20}pt`;
 const ZWSP = "\u200b";
 const isPageBreak = (br: Element) => ["page", "column"].includes(wattr(br, "type") ?? "");
 
+/** Marks the caret's place in a paragraph while it is split (a private-use character). */
+export const MARK = "\ue000";
+
+/** Child lists of elements: enough to put the document back as it was after a structural edit. */
+export type DocState = Map<Element, Node[]>;
+
+/** Elements next to paragraphs that carry no content. */
+const MARKERS = new Set(["bookmarkStart", "bookmarkEnd", "proofErr", "permStart", "permEnd", "commentRangeStart", "commentRangeEnd"]);
+
 export interface Section {
   width: number;
   height: number;
@@ -297,6 +306,7 @@ export class WordDoc {
     for (const side of ["top", "bottom", "left", "right"] as const) if (b[side]) s.setProperty(`border-${side}`, cssBorder(b[side]));
     if (pp.shd) s.background = pp.shd;
     if (pp.pageBreakBefore) div.dataset.break = "before";
+    if (pp.keepNext) div.dataset.keep = "";
     if (editable) {
       div.contentEditable = "true";
       div.spellcheck = false;
@@ -432,6 +442,7 @@ export class WordDoc {
 
     const table = document.createElement("table");
     table.className = "tbl";
+    table.dataset.t = this.id(tbl);
     const total = grid.reduce((a, b) => a + b, 0);
     table.style.width = pt(total);
     const jc = val(kid(tblPr, "jc"));
@@ -451,6 +462,7 @@ export class WordDoc {
 
     rows.forEach((trEl, r) => {
       const tr = document.createElement("tr");
+      tr.dataset.row = String(r);
       const trPr = kid(trEl, "trPr");
       const h = kid(trPr, "trHeight");
       const height = h ? +(val(h) ?? 0) : 0;
@@ -511,6 +523,230 @@ export class WordDoc {
       tbody.append(tr);
     });
     return table;
+  }
+
+
+  // ---------- structure: paragraphs split and joined, pages moved and deleted ----------
+
+  /** The XML element behind an editor block (a paragraph div or a table). */
+  xmlOf(el: HTMLElement) {
+    return this.node(el.dataset.p ?? el.dataset.t);
+  }
+
+  idOf(el: Element) {
+    return this.id(el);
+  }
+
+  /** Blocks of the body (paragraphs, tables, …) in order, without the section properties. */
+  topBlocks() {
+    return kids(this.body).filter((c) => c.localName !== "sectPr");
+  }
+
+  /** Records the child lists of `containers` and of every element inside `trees`. */
+  capture(containers: Element[], trees: Element[]): DocState {
+    const state: DocState = new Map();
+    for (const c of containers) state.set(c, Array.from(c.childNodes));
+    for (const t of trees) {
+      state.set(t, Array.from(t.childNodes));
+      for (const e of Array.from(t.getElementsByTagName("*"))) state.set(e, Array.from(e.childNodes));
+    }
+    return state;
+  }
+
+  applyState(state: DocState) {
+    for (const [el, nodes] of state) el.replaceChildren(...nodes);
+  }
+
+  /** The paragraph just before `p` in the same container, if there is one. */
+  previousParagraph(p: Element) {
+    let prev = p.previousElementSibling;
+    while (prev && MARKERS.has(prev.localName)) prev = prev.previousElementSibling;
+    return prev?.namespaceURI === W && prev.localName === "p" ? prev : undefined;
+  }
+
+  /** Splits a paragraph where MARK is in its text (Enter). Returns the new second paragraph. */
+  splitAtMark(p: Element): Element {
+    const q = this.xml.createElementNS(W, "w:p");
+    const pPr = kid(p, "pPr");
+    if (pPr) {
+      // The new paragraph is formatted the same, but does not start a page again; a section break moves to it.
+      const copy = pPr.cloneNode(true) as Element;
+      for (const c of kids(copy)) if (["pageBreakBefore", "sectPr", "pPrChange"].includes(c.localName)) c.remove();
+      const sect = kid(pPr, "sectPr");
+      if (sect) copy.append(sect);
+      q.append(copy);
+    }
+    p.after(q);
+    const t = Array.from(p.getElementsByTagNameNS(W, "t")).find((x) => x.textContent?.includes(MARK));
+    const run = t?.parentElement;
+    if (!run) return q;
+    const text = this.runText(run);
+    const at = text.indexOf(MARK);
+    const tail = this.xml.createElementNS(W, "w:r");
+    const rPr = kid(run, "rPr");
+    if (rPr) tail.append(rPr.cloneNode(true));
+    this.setRunText(run, text.slice(0, at));
+    this.setRunText(tail, text.slice(at + 1));
+    run.after(tail);
+    // Move the tail and everything after it into the new paragraph, splitting wrappers (links, …) on the way.
+    let node: Element = tail;
+    while (node.parentElement && node.parentElement !== p) {
+      const parent: Element = node.parentElement;
+      const twin = parent.cloneNode(false) as Element;
+      for (let n: Node | null = node; n; ) {
+        const next: Node | null = n.nextSibling;
+        twin.append(n);
+        n = next;
+      }
+      parent.after(twin);
+      node = twin;
+    }
+    for (let n: Node | null = node; n; ) {
+      const next: Node | null = n.nextSibling;
+      q.append(n);
+      n = next;
+    }
+    for (const r of [run, tail]) if (kids(r).every((c) => c.localName === "rPr")) r.remove();
+    // Enter at the start of a paragraph leaves an empty line above it. That line is spacing, not
+    // part of a heading: it must not "keep with next", or a few of them would chain the heading
+    // to a block taller than a page and the heading would no longer move with what follows.
+    if (this.runs(p).every((r) => !this.runText(r).trim())) for (const c of kids(kid(p, "pPr"), "keepNext")) c.remove();
+    return q;
+  }
+
+  /** Joins `p` onto the end of `prev` (Backspace at the start of a paragraph). */
+  joinParagraphs(prev: Element, p: Element) {
+    const pPr = kid(p, "pPr");
+    const sect = kid(pPr, "sectPr");
+    if (sect) {
+      let prevPPr = kid(prev, "pPr");
+      if (!prevPPr) prev.prepend((prevPPr = this.xml.createElementNS(W, "w:pPr")));
+      kid(prevPPr, "sectPr")?.remove();
+      prevPPr.append(sect);
+    }
+    for (const c of Array.from(p.childNodes)) if (c !== pPr) prev.append(c);
+    p.remove();
+  }
+
+  private top(n: Element) {
+    let e: Element = n;
+    while (e.parentElement && e.parentElement !== this.body) e = e.parentElement;
+    return e.parentElement === this.body ? e : undefined;
+  }
+
+  /** Splits a body table before row `k`; returns the new table, or undefined when it cannot. */
+  private splitTable(tbl: Element, k: number) {
+    const rows = kids(tbl, "tr");
+    const shown = kids(tbl).flatMap((c) => (c.localName === "tr" ? [c] : c.localName === "sdt" ? kids(kid(c, "sdtContent"), "tr") : []));
+    if (k <= 0 || k >= rows.length || rows.length !== shown.length) return undefined;
+    const t2 = this.xml.createElementNS(W, "w:tbl");
+    for (const name of ["tblPr", "tblGrid"]) {
+      const el = kid(tbl, name);
+      if (el) t2.append(el.cloneNode(true));
+    }
+    t2.append(...rows.slice(k));
+    tbl.after(t2);
+    return t2;
+  }
+
+  /**
+   * The body block where each page starts, from the editor's page starts (blocks or table
+   * rows). A table that a page starts inside of is split there, so each page owns whole blocks.
+   */
+  pageStarts(starts: HTMLElement[]): Element[] {
+    const out: (Element | undefined)[] = [];
+    for (let i = starts.length - 1; i >= 0; i--) {
+      const el = starts[i];
+      if (el instanceof HTMLTableRowElement) {
+        const tbl = this.node(el.closest("table")?.dataset.t);
+        const t2 = tbl && this.top(tbl) === tbl ? this.splitTable(tbl, Number(el.dataset.row)) : undefined;
+        out[i] = t2 ?? (tbl ? this.top(tbl) : undefined);
+      } else {
+        const n = this.xmlOf(el);
+        out[i] = n ? this.top(n) : undefined;
+      }
+    }
+    // Starts that fell into the same block (e.g. inside a table that could not be split) count once.
+    return out.filter((n, i): n is Element => !!n && out.indexOf(n) === i);
+  }
+
+  private chunk(starts: Element[], i: number) {
+    const out: Element[] = [];
+    for (let e: Element | null = starts[i]; e && e !== starts[i + 1] && e.localName !== "sectPr"; e = e.nextElementSibling) out.push(e);
+    return out;
+  }
+
+  /** Whether Word already starts a page at this block. */
+  private startsPage(node: Element) {
+    if (node.localName === "p") {
+      if (this.paraProps(node).pageBreakBefore) return true;
+      for (const r of this.runs(node)) {
+        if (kids(r, "br").some(isPageBreak)) return true;
+        if (this.runText(r).trim()) break;
+      }
+    }
+    let prev = node.previousElementSibling;
+    while (prev && MARKERS.has(prev.localName)) prev = prev.previousElementSibling;
+    if (prev?.localName !== "p") return false;
+    const runs = this.runs(prev);
+    const last = runs.map((r) => kids(r, "br").some(isPageBreak)).lastIndexOf(true);
+    return last >= 0 && runs.slice(last + 1).every((r) => !this.runText(r).trim());
+  }
+
+  /** Makes a page start at this block (unless it is first, or already starts one). */
+  private breakBefore(node: Element) {
+    if (this.topBlocks()[0] === node || this.startsPage(node)) return;
+    const el = (name: string, attrs: Record<string, string> = {}) => {
+      const e = this.xml.createElementNS(W, `w:${name}`);
+      for (const [k, v] of Object.entries(attrs)) e.setAttributeNS(W, `w:${k}`, v);
+      return e;
+    };
+    if (node.localName === "p") {
+      let pPr = kid(node, "pPr");
+      if (!pPr) node.prepend((pPr = el("pPr")));
+      pPr.insertBefore(el("pageBreakBefore"), kids(pPr).find((c) => !["pStyle", "keepNext", "keepLines"].includes(c.localName)) ?? null);
+      return;
+    }
+    // A table cannot start a page by itself: a one-point empty paragraph before it does.
+    const pPr = el("pPr");
+    const rPr = el("rPr");
+    rPr.append(el("sz", { val: "2" }), el("szCs", { val: "2" }));
+    pPr.append(el("pageBreakBefore"), el("spacing", { before: "0", after: "0", line: "20", lineRule: "exact" }), rPr);
+    const p = el("p");
+    p.append(pPr);
+    node.before(p);
+  }
+
+  /** Word needs a paragraph in the body, and one after a final table. */
+  private fixEnd() {
+    const blocks = this.topBlocks().filter((b) => !MARKERS.has(b.localName));
+    const last = blocks[blocks.length - 1];
+    if (!last || last.localName === "tbl") {
+      const p = this.xml.createElementNS(W, "w:p");
+      const sect = kid(this.body, "sectPr");
+      this.body.insertBefore(p, sect ?? null);
+    }
+  }
+
+  /** Deletes page `i`; the page after it keeps starting on a new page. */
+  deletePage(starts: Element[], i: number) {
+    for (const n of this.chunk(starts, i)) n.remove();
+    if (i > 0 && starts[i + 1]) this.breakBefore(starts[i + 1]);
+    this.fixEnd();
+  }
+
+  /** Swaps page `i` with the one before (dir -1) or after (dir 1). */
+  movePage(starts: Element[], i: number, dir: -1 | 1) {
+    const [a, b] = dir < 0 ? [i - 1, i] : [i, i + 1];
+    if (a < 0 || b >= starts.length) return;
+    const first = this.chunk(starts, a);
+    const second = this.chunk(starts, b);
+    const after = starts[b + 1];
+    first[0].before(...second);
+    if (second[0]) this.breakBefore(second[0]);
+    this.breakBefore(first[0]);
+    if (after) this.breakBefore(after);
+    this.fixEnd();
   }
 
   // ---------- editing ----------

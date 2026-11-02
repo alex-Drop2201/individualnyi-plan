@@ -1,8 +1,9 @@
 import "./style.css";
 import { DOC_CSS } from "./docx/css";
-import { DOCX_TYPE, WordDoc } from "./docx/document";
+import { DOCX_TYPE, MARK, WordDoc, type DocState } from "./docx/document";
 import { canShareFiles, shareFile } from "./files";
 import { hasLine, keepLineLength, shapeOf, typeOnLine, type Shape } from "./fill";
+import { Pager } from "./pages";
 import { makePdf } from "./pdf";
 import { changeDoc, deleteDoc, getDoc, listDocs, newId, putDoc, type DocRecord } from "./store";
 import { checkConfig, DEFAULT_CONFIG, forget, getConfig, onNotice, onSync, setConfig, syncNow, syncSoon, syncState, type SyncState } from "./sync";
@@ -299,10 +300,12 @@ async function showEditor(id: string) {
     return;
   }
 
-  const { width, top, right, bottom, left, height } = doc.section;
+  const { width, top, right, left } = doc.section;
   const body = h("div", { class: "body" }, ...doc.render(true));
   const page = h("div", { class: "page editing" }, body);
-  Object.assign(page.style, { width: `${width}pt`, minHeight: `${height}pt`, padding: `${top}pt ${right}pt ${bottom}pt ${left}pt` });
+  Object.assign(page.style, { width: `${width}pt`, padding: `${top}pt ${right}pt 0 ${left}pt` });
+  // The document as sheets: page gaps go into the one column (src/pages.ts).
+  const pager = new Pager(page, body, doc.section);
   const zoomBox = h("div", { class: "zoom" }, page);
   const scroller = h("main", { class: "scroller" }, zoomBox);
 
@@ -350,8 +353,9 @@ async function showEditor(id: string) {
 
   const paraOf = (t: EventTarget | null) => (t instanceof Element ? (t.closest(".p") as HTMLElement | null) : null);
 
-  // Undo and redo: each step is one paragraph before and after a burst of typing.
-  interface Step { pid: string; before: string; after: string; at: number }
+  // Undo and redo. A step is one paragraph before and after a burst of typing, or, for
+  // structural edits (Enter, joining paragraphs, pages), the document's structure before and after.
+  type Step = { pid: string; before: string; after: string; at: number } | { state: true; before: DocState; after: DocState };
   const undos: Step[] = [];
   const redos: Step[] = [];
   const known = new Map<string, string>(); // paragraph XML as last recorded
@@ -366,7 +370,7 @@ async function showEditor(id: string) {
     known.set(pid, after);
     if (before === after) return;
     const top = undos[undos.length - 1];
-    if (top && top.pid === pid && Date.now() - top.at < 2000) Object.assign(top, { after, at: Date.now() });
+    if (top && "pid" in top && top.pid === pid && Date.now() - top.at < 2000) Object.assign(top, { after, at: Date.now() });
     else undos.push({ pid, before, after, at: Date.now() });
     if (undos.length > 300) undos.shift();
     redos.length = 0;
@@ -376,6 +380,14 @@ async function showEditor(id: string) {
     (document.activeElement as HTMLElement | null)?.blur?.(); // records the paragraph being typed in first
     const s = from.pop();
     if (!s) return;
+    if ("state" in s) {
+      doc.applyState(s[key]);
+      rerender();
+      changed();
+      to.push(s);
+      paintUndo();
+      return;
+    }
     const div = body.querySelector<HTMLElement>(`[data-p="${s.pid}"]`);
     if (div) {
       const fresh = doc.restore(div, s[key]);
@@ -390,6 +402,103 @@ async function showEditor(id: string) {
     to.push(s);
     paintUndo();
   };
+  const pushState = (before: DocState, after: DocState) => {
+    undos.push({ state: true, before, after });
+    if (undos.length > 300) undos.shift();
+    redos.length = 0;
+    paintUndo();
+  };
+  // While a structural edit redraws the document, the paragraph that had the caret is removed;
+  // browsers send its focusout as it goes, and its old text must not be written back.
+  let restructuring = false;
+  /** Draws the whole document again (after a structural edit) and lays out the pages. */
+  const rerender = () => {
+    restructuring = true;
+    try {
+      body.replaceChildren(...doc.render(true));
+    } finally {
+      restructuring = false;
+    }
+    known.clear();
+    pager.update(true);
+  };
+  const divOf = (el: Element) => body.querySelector<HTMLElement>(`[data-p="${doc.idOf(el)}"]`);
+  const shownText = (n: Node) => !n.parentElement?.closest("[data-skip],[data-l]");
+  const textLength = (div: HTMLElement) => {
+    let n = 0;
+    const walker = document.createTreeWalker(div, NodeFilter.SHOW_TEXT);
+    for (let t = walker.nextNode(); t; t = walker.nextNode()) if (shownText(t)) n += t.nodeValue?.length ?? 0;
+    return n;
+  };
+  /** Puts the caret `offset` characters into a paragraph. */
+  const caretTo = (div: HTMLElement, offset: number) => {
+    div.focus();
+    const r = document.createRange();
+    r.setStart(div, 0);
+    let left = offset;
+    const walker = document.createTreeWalker(div, NodeFilter.SHOW_TEXT);
+    for (let t = walker.nextNode() as Text | null; t; t = walker.nextNode() as Text | null) {
+      if (!shownText(t)) continue;
+      if (left <= t.data.length) {
+        r.setStart(t, left);
+        break;
+      }
+      left -= t.data.length;
+    }
+    r.collapse(true);
+    const sel = getSelection();
+    sel?.removeAllRanges();
+    sel?.addRange(r);
+  };
+  const atStart = (div: HTMLElement) => {
+    const sel = getSelection();
+    if (!sel?.isCollapsed || !sel.anchorNode || !div.contains(sel.anchorNode)) return false;
+    const r = document.createRange();
+    r.setStart(div, 0);
+    r.setEnd(sel.anchorNode, sel.anchorOffset);
+    const part = r.cloneContents();
+    part.querySelectorAll("[data-skip]").forEach((e) => e.remove());
+    return !part.textContent && !part.querySelector("br,img");
+  };
+  /** Enter: splits the paragraph at the caret, as Word does. */
+  const splitHere = (div: HTMLElement) => {
+    const p = doc.xmlOf(div);
+    const container = p?.parentElement;
+    if (!p || !container) return;
+    if (doc.sync(div)) record(div);
+    const before = doc.capture([container], [p]);
+    const sel = getSelection();
+    if (sel?.rangeCount) {
+      const r = sel.getRangeAt(0);
+      r.deleteContents();
+      r.insertNode(document.createTextNode(MARK));
+    } else div.append(MARK);
+    doc.sync(div);
+    const q = doc.splitAtMark(p);
+    pushState(before, doc.capture([container], [p, q]));
+    rerender();
+    const next = divOf(q);
+    if (next) caretTo(next, 0);
+    changed();
+  };
+  /** Backspace at the start of a paragraph: joins it to the one before. */
+  const joinUp = (div: HTMLElement) => {
+    const p = doc.xmlOf(div);
+    const prev = p && doc.previousParagraph(p);
+    const container = p?.parentElement;
+    if (!p || !prev || !container) return;
+    if (doc.sync(div)) record(div);
+    const prevDiv = divOf(prev);
+    const at = prevDiv ? textLength(prevDiv) : 0;
+    const before = doc.capture([container], [prev, p]);
+    doc.joinParagraphs(prev, p);
+    pushState(before, doc.capture([container], [prev]));
+    rerender();
+    const joined = divOf(prev);
+    if (joined) caretTo(joined, at);
+    changed();
+  };
+
   const undo = () => step(undos, redos, "before");
   const redo = () => step(redos, undos, "after");
   const undoBtn = h("button", { class: "icon-btn", ariaLabel: "Отменить", textContent: "↶", onclick: undo });
@@ -429,9 +538,14 @@ async function showEditor(id: string) {
       return;
     }
     if (e.inputType === "insertParagraph") {
-      // Enter starts a new line inside the same paragraph (a line break in Word).
+      // Enter makes a new paragraph, as in Word: what follows moves down, onto the next page if need be.
       e.preventDefault();
-      document.execCommand("insertLineBreak");
+      if (div) splitHere(div);
+      return;
+    }
+    if (e.inputType === "deleteContentBackward" && div && atStart(div)) {
+      e.preventDefault();
+      joinUp(div);
       return;
     }
     widthBefore = div && hasLine(div) ? { div, shape: shapeOf(div) } : null;
@@ -455,7 +569,8 @@ async function showEditor(id: string) {
   });
   body.addEventListener("focusout", (e) => {
     const div = paraOf(e.target);
-    if (!div) return;
+    if (restructuring || !div?.isConnected) return; // redrawn by a structural edit
+
     if (doc.sync(div)) {
       changed();
       record(div);
@@ -471,6 +586,67 @@ async function showEditor(id: string) {
     }
     return saveNow?.();
   };
+  // The pages panel: go to a page, move it, delete it.
+  const openPages = async () => {
+    await flush();
+    const list = h("ol", { class: "pages" });
+    const pageOp = (op: (starts: Element[]) => void) => {
+      const starts = pager.pages().map((pg) => pg.start);
+      const before = doc.capture([doc.body], doc.topBlocks());
+      const xmlStarts = doc.pageStarts(starts);
+      if (xmlStarts.length !== starts.length) {
+        doc.applyState(before);
+        alert("Эту страницу нельзя переставить или удалить: она начинается в середине длинного абзаца или таблицы. Сдвиньте текст клавишей Enter, чтобы страница начиналась с нового абзаца.");
+        return;
+      }
+      op(xmlStarts);
+      pushState(before, doc.capture([doc.body], doc.topBlocks()));
+      rerender();
+      changed();
+      paint();
+    };
+    const paint = () => {
+      const pages = pager.pages();
+      list.replaceChildren(
+        ...pages.map((pg, i) =>
+          h(
+            "li",
+            { class: "page-item" },
+            h(
+              "button",
+              { class: "page-go", onclick: () => { close(); pager.sheet(i)?.scrollIntoView({ block: "start" }); } },
+              h("span", { class: "page-no" }, String(i + 1)),
+              h("span", { class: "page-text" }, pg.text || "Пустая страница"),
+            ),
+            h("button", { class: "icon-btn", ariaLabel: `Страницу ${i + 1} выше`, textContent: "↑", disabled: i === 0, onclick: () => pageOp((s) => doc.movePage(s, i, -1)) }),
+            h("button", { class: "icon-btn", ariaLabel: `Страницу ${i + 1} ниже`, textContent: "↓", disabled: i === pages.length - 1, onclick: () => pageOp((s) => doc.movePage(s, i, 1)) }),
+            h("button", {
+              class: "icon-btn danger",
+              ariaLabel: `Удалить страницу ${i + 1}`,
+              textContent: "✕",
+              disabled: pages.length === 1,
+              onclick: () => {
+                if (confirm(`Удалить страницу ${i + 1}? Вернуть её можно кнопкой ↶.`)) pageOp((s) => doc.deletePage(s, i));
+              },
+            }),
+          ),
+        ),
+      );
+    };
+    const panel = h(
+      "aside",
+      { class: "drawer" },
+      h("div", { class: "drawer-head" }, h("strong", {}, "Страницы"), h("button", { class: "icon-btn", ariaLabel: "Закрыть", textContent: "✕", onclick: () => close() })),
+      h("p", { class: "drawer-note" }, "↑ ↓ меняют страницу местами с соседней, ✕ удаляет. Всё отменяется кнопкой ↶."),
+      list,
+    );
+    const overlay = h("div", { class: "overlay side" }, panel);
+    const close = () => overlay.remove();
+    overlay.onclick = (e) => e.target === overlay && close();
+    paint();
+    document.body.append(overlay);
+  };
+
   const back = async () => {
     await flush();
     location.hash = "";
@@ -487,7 +663,13 @@ async function showEditor(id: string) {
   }
 
   app.replaceChildren(
-    h("header", { class: "bar" }, h("button", { class: "btn back", onclick: back }, "‹ Документы"), h("div", { class: "titles" }, title, status)),
+    h(
+      "header",
+      { class: "bar" },
+      h("button", { class: "btn back", onclick: back }, "‹ Документы"),
+      h("div", { class: "titles" }, title, status),
+      h("button", { class: "btn small", onclick: () => void openPages() }, "Страницы"),
+    ),
     ...(hint ? [hint] : []),
     scroller,
     h(
@@ -503,6 +685,7 @@ async function showEditor(id: string) {
     ),
   );
   applyZoom();
+  pager.update(true);
   window.onresize = applyZoom;
   view = { id, pending: () => timer !== 0 || !!paraOf(document.activeElement) };
 }

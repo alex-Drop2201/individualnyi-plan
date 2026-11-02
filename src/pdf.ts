@@ -1,12 +1,11 @@
-// PDF: lays the document out on A4 (or the document's own) pages, draws each page into a
-// picture and puts the pictures into a PDF. Breaks fall between paragraphs and between table
-// rows (rows joined by a merged cell stay together), and at Word's own page breaks.
+// PDF: cuts the document into pages where the editor shows them (src/pages.ts), draws each
+// page into a picture and puts the pictures into a PDF.
 import html2canvas from "html2canvas";
 import { jsPDF } from "jspdf";
 import type { WordDoc } from "./docx/document";
 import { DOC_CSS } from "./docx/css";
+import { planBreaks, PX } from "./pages";
 
-const PX = 4 / 3; // CSS px per pt
 const SCALE = 2.5; // ≈ 240 dpi on A4
 
 export async function makePdf(doc: WordDoc): Promise<Blob> {
@@ -15,7 +14,19 @@ export async function makePdf(doc: WordDoc): Promise<Blob> {
   host.className = "pdf-host";
   document.body.append(host);
   try {
-    const limit = (height - top - bottom) * PX + 0.5;
+    // Lay the document out in one column at page width, find the page breaks the editor shows…
+    const flow = document.createElement("div");
+    flow.className = "page";
+    Object.assign(flow.style, { width: `${width}pt`, padding: `0 ${right}pt 0 ${left}pt` });
+    const column = document.createElement("div");
+    column.className = "body";
+    const blocks = doc.render(false);
+    column.append(...blocks);
+    flow.append(column);
+    host.append(flow);
+    const starts = new Set<HTMLElement>(planBreaks(blocks, (height - top - bottom) * PX).map((b) => b.at));
+
+    // …then cut it into pages there.
     const pages: HTMLElement[] = [];
     let content!: HTMLElement;
     const newPage = () => {
@@ -28,51 +39,28 @@ export async function makePdf(doc: WordDoc): Promise<Blob> {
       host.append(page);
       pages.push(page);
     };
-    const fits = () => content.offsetHeight <= limit;
-
     newPage();
-    for (const block of doc.render(false)) {
-      if (block.dataset.break === "before" && content.childElementCount) newPage();
+    for (const block of blocks) {
+      if (starts.has(block) && content.childElementCount) newPage();
       content.append(block);
-      if (!fits() && content.childElementCount > 1) {
-        if (block instanceof HTMLTableElement) splitTable(block);
-        else {
-          newPage();
-          content.append(block);
+      if (!(block instanceof HTMLTableElement)) continue;
+      // Rows where a page starts go into a copy of the table on the next page.
+      let tbody = block.tBodies[0];
+      for (const row of Array.from(tbody.rows)) {
+        if (!starts.has(row)) continue;
+        newPage();
+        const t = block.cloneNode(false) as HTMLTableElement;
+        t.append(block.querySelector("colgroup")!.cloneNode(true), (tbody = document.createElement("tbody")));
+        content.append(t);
+        for (let r: Element | null = row; r; ) {
+          const next: Element | null = r.nextElementSibling;
+          if (starts.has(r as HTMLElement) && r !== row) break;
+          tbody.append(r);
+          r = next;
         }
       }
-      if (block.dataset.break === "after") newPage();
     }
-
-    function splitTable(table: HTMLTableElement) {
-      const rows = Array.from(table.tBodies[0].rows);
-      const units: HTMLTableRowElement[][] = [];
-      let reach = -1;
-      rows.forEach((tr, i) => {
-        if (i > reach) units.push([]);
-        units[units.length - 1].push(tr);
-        for (const td of Array.from(tr.cells)) reach = Math.max(reach, i + td.rowSpan - 1);
-      });
-      const shell = () => {
-        const t = table.cloneNode(false) as HTMLTableElement;
-        t.append(table.querySelector("colgroup")!.cloneNode(true), document.createElement("tbody"));
-        content.append(t);
-        return t.tBodies[0];
-      };
-      table.remove();
-      let tbody = shell();
-      for (const unit of units) {
-        tbody.append(...unit);
-        if (fits()) continue;
-        const alone = tbody.rows.length === unit.length && content.childElementCount === 1;
-        if (alone) continue; // taller than a page: nothing better to do
-        unit.forEach((r) => r.remove());
-        if (!tbody.rows.length) tbody.parentElement!.remove();
-        newPage();
-        tbody = shell();
-        tbody.append(...unit);
-      }
-    }
+    flow.remove();
 
     const pdf = new jsPDF({ unit: "pt", format: [width, height], orientation: width > height ? "landscape" : "portrait", compress: true });
     for (let i = 0; i < pages.length; i++) {

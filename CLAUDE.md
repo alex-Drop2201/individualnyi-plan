@@ -22,6 +22,9 @@ PWA for editing the text of .docx documents on iPhone; the owner builds it for t
 - `toDocx()` puts zero-width spaces between the underscores of long lines (10+) so Word wraps them like the editor does; `open()` takes them out again. Keep both sides in step.
 - Undo/redo (editor buttons): per-paragraph XML snapshots (`WordDoc.snapshot` / `restore`), one step per burst of typing.
 - The editor page is laid out at full size and scaled with a transform. Do not use CSS `zoom`: on iPhone it enlarged small text and dropped thin table borders.
+- Rendered borders are at least 1px (`MIN_BORDER`): Safari drops collapsed table borders under 1px, and Word's usual ½pt is 0.67px. Chrome draws them anyway, so check widths, not screenshots.
+- Pages (`src/pages.ts`): `planBreaks` decides where pages start (between blocks and row groups, Word's page breaks, keep-with-next). The editor shows them with `.pg-gap` spacers in the one column (never move edited elements); the PDF cuts at the same places. Page moves/deletes (`WordDoc.movePage`/`deletePage`) split tables at page starts and add page breaks so pages stay as the user sees them.
+- Enter splits the paragraph (`splitAtMark`), Backspace at its start joins it (`joinParagraphs`). Structural undo steps record element child lists (`capture`/`applyState`), keeping element identity so per-paragraph steps stay valid. While the document is redrawn, focusout must not write the removed paragraph's old text back (`restructuring`).
 
 ## Sync and the `data` branch
 
